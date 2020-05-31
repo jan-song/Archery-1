@@ -615,6 +615,7 @@ class OracleEngine(EngineBase):
         execute_result = ReviewSet(full_sql=sql)
 
         line = 1
+        failed_line = 0
         statement = None
         try:
             conn = self.get_connection()
@@ -632,7 +633,7 @@ class OracleEngine(EngineBase):
                 with FuncTimer() as t:
                     if statement != '':
                         cursor.execute(statement)
-                        conn.commit()
+                        #conn.commit()
 
                 rowcount = cursor.rowcount
                 stagestatus = "Execute Successfully"
@@ -666,7 +667,9 @@ class OracleEngine(EngineBase):
         except Exception as e:
             logger.warning(f"Oracle命令执行报错，工单id：{workflow.id}，语句：{statement or sql}， 错误信息：{traceback.format_exc()}")
             execute_result.error = str(e)
-            # conn.rollback()
+            # 捕获异常，回滚未提交事务,标记备份结束位置
+            conn.rollback()
+            failed_line = line
             # 追加当前报错语句信息到执行结果中
             execute_result.rows.append(ReviewResult(
                 id=line,
@@ -691,6 +694,8 @@ class OracleEngine(EngineBase):
                 ))
                 line += 1
         finally:
+            # 完成会话做提交
+            conn.commit()
             # 备份
             if workflow.is_backup:
                 try:
@@ -699,7 +704,31 @@ class OracleEngine(EngineBase):
                     end_time = rows[0]
                     self.backup(workflow, cursor=cursor, begin_time=begin_time, end_time=end_time)
                 except Exception as e:
-                    logger.error(f"Oracle工单备份异常，工单id：{workflow.id}， 错误信息：{traceback.format_exc()}")
+                    logger.warning(f"Oracle工单备份异常，工单id：{workflow.id}， 错误信息：{traceback.format_exc()}")
+                    execute_result.error = str(e)
+                    if failed_line > 0:
+                        while failed_line > 0:
+                            execute_result.rows[failed_line].errlevel = 1
+                            execute_result.rows[failed_line].stagestatus = execute_result.rows[failed_line].stagestatus + "\n Backup failed"
+                            execute_result.rows[failed_line].errormessage = f"备份失败：{str(e)}"
+                            failed_line -= 1
+                    else:
+                        line = line - 2
+                        while line > 0:
+                            execute_result.rows[line].errlevel = 1
+                            execute_result.rows[line].stagestatus = execute_result.rows[line].stagestatus + "\n Backup failed"
+                            execute_result.rows[line].errormessage = f"备份失败：{str(e)}"
+                            line -= 1
+                else:
+                    if failed_line > 0:
+                        while failed_line > 0:
+                            execute_result.rows[line - 2].stagestatus = execute_result.rows[line - 2].stagestatus + "\n Backup successfully"
+                            failed_line -= 1
+                    else:
+                        line = line - 2
+                        while line > 0:
+                            execute_result.rows[line - 2].stagestatus = execute_result.rows[line - 2].stagestatus + "\n Backup successfully"
+                            line -= 1
             if close_conn:
                 self.close()
         return execute_result
@@ -738,10 +767,17 @@ class OracleEngine(EngineBase):
                                         endtime=>to_date('{end_time}','yyyy/mm/dd hh24:mi:ss'),
                                         options=>dbms_logmnr.dict_from_online_catalog + dbms_logmnr.continuous_mine);
                                     end;'''
-            undo_sql = f'''select sql_redo,sql_undo from v$logmnr_contents 
-                                  where  SEG_OWNER not in ('SYS','SYSTEM')
-                                         and session# = (select sid from v$mystat where rownum = 1)
-                                         and serial# = (select serial# from v$session s where s.sid = (select sid from v$mystat where rownum = 1 )) order by scn desc'''
+            undo_sql = f'''select sql_redo,
+                                  case OPERATION_CODE 
+                                  when 6 then 'set transaction read write;' 
+                                  when 7 then 'commit;' 
+                                  when 36 then 'rollback;' 
+                                  else sql_undo end as sql_undo
+                             from v$logmnr_contents
+                             where (SEG_OWNER not in ('SYS', 'SYSTEM') or seg_owner is null)
+                               and session# = (select sid from v$mystat where rownum = 1)
+                               and serial# =(select serial# from v$session s where s.sid = (select sid from v$mystat where rownum = 1))
+                               order by scn, ssn desc'''
             logmnr_end_sql = f'''begin
                                     dbms_logmnr.end_logmnr;
                                  end;'''
@@ -763,7 +799,7 @@ class OracleEngine(EngineBase):
                     backup_cursor.execute(sql)
         except Exception as e:
             logger.warning(f"备份失败，错误信息{traceback.format_exc()}")
-            return False
+            raise Exception(e)
         finally:
             # 关闭连接
             if conn:
@@ -793,7 +829,7 @@ class OracleEngine(EngineBase):
                 # 拼接成回滚语句列表,['源语句'，'回滚语句']
                 list_backup_sql.append([redo_sql, undo_sql])
         except Exception as e:
-            logger.error(f"获取回滚语句报错，异常信息{traceback.format_exc()}")
+            logger.warning(f"获取回滚语句报错，异常信息{traceback.format_exc()}")
             raise Exception(e)
         # 关闭连接
         if conn:
